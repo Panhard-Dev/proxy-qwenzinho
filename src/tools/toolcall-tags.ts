@@ -85,6 +85,12 @@ export function matchToolCloseAt(buffer: string, i: number): number | null {
     const prefix = `</${name}`;
     if (!matchesAt(buffer, i, prefix)) continue;
     let j = i + prefix.length;
+    // Accept mutated/suffixed close tags like `</tool_call_read>` or
+    // `</tool_call_edit>` — models sometimes append the tool name to the
+    // close tag. Callers gate acceptance on the preceding payload being a
+    // parseable tool call, so prose like `</toolbar>` cannot close a real
+    // call by accident.
+    while (j < buffer.length && /[\w-]/.test(buffer[j])) j++;
     // Allow optional whitespace before closing `>`
     while (j < buffer.length && /\s/.test(buffer[j])) j++;
     if (buffer[j] === ">") return j + 1 - i;

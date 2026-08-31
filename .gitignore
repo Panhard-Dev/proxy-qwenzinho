@@ -23,6 +23,11 @@ accounts.json.bak
 log*.txt
 qwenproxy-api-*.log.txt
 
+# Test artifacts / scratch outputs
+baseline-full.txt
+test-output.txt
+test-mock-output.txt
+
 # Network captures
 network/
 

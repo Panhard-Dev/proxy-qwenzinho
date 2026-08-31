@@ -58,6 +58,97 @@ interface ActiveIncrementalToolCall {
 const TOOL_END = "</" + "tool_call>";
 const TOOL_END_ALIASES = ["</" + "tool_calls>", TOOL_END];
 
+// ─── Token-style tool-call dialect (DeepSeek/Kimi special tokens) ────────────
+//
+// Some upstream models emit tool calls with special-token markers instead of
+// XML tags, e.g.:
+//   <|tool_call_begin|>Bash<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>
+// Mutated variants observed in the wild drop the pipes or add a slash:
+//   <tool_call_begin|>Bash ... </tool_call_end|>
+// Section wrappers may surround the calls:
+//   <|tool_calls_section_begin|> ... <|tool_calls_section_end|>
+//   <tool_call_lines_begin|> ... <tool_call_lines_end|>
+// These must never leak as visible text; when parseable they are emitted as
+// normal tool calls, otherwise tracked as malformed for the auto-retry.
+
+const TOKEN_CALL_BEGIN_RE = /<\/?\|?tool_call_begin\|?>/i;
+const TOKEN_CALL_ARG_RE = /<\/?\|?tool_call_argument_begin\|?>/i;
+const TOKEN_CALL_END_RE = /<\/?\|?tool_call_end\|?>/i;
+const TOKEN_SECTION_RE =
+  /<\/?\|?tool_calls?_(?:section|lines)_(?:begin|end)\|?>/i;
+
+/** Literal token-marker shapes for tail-prefix (partial chunk) detection. */
+const TOKEN_MARKER_LITERALS: string[] = (() => {
+  const names = [
+    "tool_call_begin",
+    "tool_call_argument_begin",
+    "tool_call_end",
+    "tool_calls_section_begin",
+    "tool_calls_section_end",
+    "tool_call_section_begin",
+    "tool_call_section_end",
+    "tool_call_lines_begin",
+    "tool_call_lines_end",
+    "tool_calls_lines_begin",
+    "tool_calls_lines_end",
+  ];
+  const shapes: string[] = [];
+  for (const n of names) {
+    shapes.push(`<|${n}|>`, `<${n}|>`, `</${n}|>`, `<|${n}>`, `<${n}>`);
+  }
+  return shapes;
+})();
+
+/**
+ * Index of a trailing PARTIAL token marker (chunk boundary cut a marker like
+ * `<|tool_call_be`), so it is held in the buffer instead of leaking as text.
+ * Only scans the final 40 chars (markers are short).
+ */
+function findPartialTokenMarkerIndex(buffer: string): number {
+  const from = Math.max(0, buffer.length - 40);
+  for (let i = from; i < buffer.length; i++) {
+    if (buffer[i] !== "<") continue;
+    const tail = buffer.substring(i).toLowerCase();
+    if (tail.includes(">")) continue;
+    for (const literal of TOKEN_MARKER_LITERALS) {
+      if (literal.startsWith(tail)) return i;
+    }
+  }
+  return -1;
+}
+
+/** Earliest full token-dialect marker (begin or section) in the buffer. */
+function findTokenDialectMarker(
+  buffer: string,
+): { index: number; length: number; kind: "begin" | "section" } | null {
+  const begin = buffer.match(TOKEN_CALL_BEGIN_RE);
+  const section = buffer.match(TOKEN_SECTION_RE);
+  let best: { index: number; length: number; kind: "begin" | "section" } | null =
+    null;
+  if (begin && begin.index !== undefined) {
+    best = { index: begin.index, length: begin[0].length, kind: "begin" };
+  }
+  if (
+    section &&
+    section.index !== undefined &&
+    (!best || section.index < best.index)
+  ) {
+    best = { index: section.index, length: section[0].length, kind: "section" };
+  }
+  return best;
+}
+
+/**
+ * Normalize a token-dialect tool name: DeepSeek emits `functions.NAME:IDX`,
+ * others emit the bare name, possibly wrapped in whitespace/quotes.
+ */
+function normalizeTokenDialectToolName(raw: string): string {
+  let name = raw.trim().replace(/^["'`]+|["'`]+$/g, "");
+  name = name.replace(/^functions\./i, "");
+  name = name.replace(/:\d+$/, "");
+  return name.trim();
+}
+
 interface ToolEndMatch {
   index: number;
   tag: string;
@@ -1137,6 +1228,8 @@ function getToolDefinitionProperties(
 export class StreamingToolParser {
   private buffer = "";
   private insideTool = false;
+  /** Inside a token-style call (`<|tool_call_begin|>` dialect). */
+  private insideTokenCall = false;
   private currentOpenTag = TOOL_START_LITERAL;
   private currentCloseTag = TOOL_END;
   private emittedToolCallCount = 0;
@@ -1693,11 +1786,47 @@ export class StreamingToolParser {
     };
 
     while (this.buffer.length > 0) {
+      if (this.insideTokenCall) {
+        if (!this.processTokenDialectCall(result)) break;
+        continue;
+      }
       if (!this.insideTool) {
-        const match = findNextToolOpenTagOutsideMarkdownCode(
+        // Token-style dialect (`<|tool_call_begin|>` / section wrappers) —
+        // must be checked before the generic text-flush path so the markers
+        // never leak as visible text.
+        const xmlOpenMatch = findNextToolOpenTagOutsideMarkdownCode(
           this.buffer,
           this.markdownCodeDelimiterLength,
         );
+        const tokenMarker = findTokenDialectMarker(this.buffer);
+        if (
+          tokenMarker &&
+          (!xmlOpenMatch || tokenMarker.index < xmlOpenMatch.index) &&
+          !isInsideMarkdownCodeAtIndex(
+            this.buffer,
+            tokenMarker.index,
+            this.markdownCodeDelimiterLength,
+          ) &&
+          !isPrecededByBacktick(this.buffer, tokenMarker.index)
+        ) {
+          const textBefore = this.buffer.substring(0, tokenMarker.index);
+          if (tokenMarker.kind === "section") {
+            // Section wrappers are pure noise: swallow the marker itself.
+            this.emitVisibleText(result, textBefore);
+            this.buffer = this.buffer.substring(
+              tokenMarker.index + tokenMarker.length,
+            );
+            continue;
+          }
+          this.holdLeadIn(textBefore);
+          this.buffer = this.buffer.substring(
+            tokenMarker.index + tokenMarker.length,
+          );
+          this.insideTokenCall = true;
+          continue;
+        }
+
+        const match = xmlOpenMatch;
         if (match) {
           // Text before the tool call tag
           const textBefore = this.buffer.substring(0, match.index);
@@ -1759,12 +1888,16 @@ export class StreamingToolParser {
             this.buffer,
             this.markdownCodeDelimiterLength,
           );
+          const partialTokenIdx = findPartialTokenMarkerIndex(this.buffer);
+          const partialCandidates = [
+            partialMissingOpenIdx,
+            partialOpenIdx,
+            partialTokenIdx,
+          ].filter((idx) => idx !== -1);
           const partialIdx =
-            partialMissingOpenIdx === -1
-              ? partialOpenIdx
-              : partialOpenIdx === -1
-                ? partialMissingOpenIdx
-                : Math.min(partialMissingOpenIdx, partialOpenIdx);
+            partialCandidates.length === 0
+              ? -1
+              : Math.min(...partialCandidates);
           const flushIndex =
             partialIdx === -1 ? this.buffer.length : partialIdx;
           if (flushIndex > 0) {
@@ -1855,6 +1988,31 @@ export class StreamingToolParser {
       toolCallDeltas: [],
     };
     if (!this.buffer && !this.pendingLeadIn) return result;
+
+    if (this.insideTokenCall) {
+      // Stream ended inside a token-dialect call. Try a full parse of the
+      // remaining body (the end marker may simply have been dropped); the
+      // truncation gates inside finalizeTokenDialectBody keep cut JSON out.
+      const body = this.buffer.trim();
+      this.insideTokenCall = false;
+      if (body.length > 0) {
+        this.finalizeTokenDialectBody(body, result);
+      }
+      if (
+        this.emittedToolCallCount === 0 &&
+        result.toolCalls.length === 0 &&
+        this.pendingLeadIn.trim().length > 0
+      ) {
+        result.text += this.pendingLeadIn;
+      }
+      this.pendingLeadIn = "";
+      this.buffer = "";
+      this.currentOpenTag = TOOL_START_LITERAL;
+      this.currentCloseTag = TOOL_END;
+      this.markdownCodeDelimiterLength = 0;
+      this.clearIncrementalToolCall();
+      return result;
+    }
 
     if (this.insideTool) {
       // Stream ended with unclosed <tool_call>. Try to recover.
@@ -2046,6 +2204,122 @@ export class StreamingToolParser {
   }
 
   // ─── Internal Methods ──────────────────────────────────────────────────────
+
+  /**
+   * Consume one token-dialect call from the head of the buffer:
+   *   NAME <|tool_call_argument_begin|> {json} <|tool_call_end|>
+   * (begin marker already consumed by the caller). Returns true when a call
+   * was consumed (loop continues), false when more data is needed.
+   */
+  private processTokenDialectCall(result: ParserResult): boolean {
+    const endMatch = this.buffer.match(TOKEN_CALL_END_RE);
+    if (!endMatch || endMatch.index === undefined) {
+      // No end marker yet — wait for more data unless the buffer is clearly
+      // not a token call anymore (defensive cap: 512KB).
+      return false;
+    }
+
+    const body = this.buffer.substring(0, endMatch.index);
+    this.buffer = this.buffer.substring(endMatch.index + endMatch[0].length);
+    this.insideTokenCall = false;
+
+    this.finalizeTokenDialectBody(body, result);
+    return true;
+  }
+
+  /** Parse a token-dialect call body (NAME [+ arg marker + JSON]). */
+  private finalizeTokenDialectBody(body: string, result: ParserResult): void {
+    const argMatch = body.match(TOKEN_CALL_ARG_RE);
+    let rawName: string;
+    let rawArgs: string;
+    if (argMatch && argMatch.index !== undefined) {
+      rawName = body.substring(0, argMatch.index);
+      rawArgs = body.substring(argMatch.index + argMatch[0].length).trim();
+    } else {
+      rawName = body;
+      rawArgs = "";
+    }
+
+    const name = normalizeTokenDialectToolName(rawName);
+    const resolvedName = name ? this.resolveDeclaredToolName(name) : null;
+
+    // Some models put the whole JSON payload (with "name") in the body with
+    // no separate name segment — fall back to the standard JSON paths.
+    if (!resolvedName && body.includes('"name"')) {
+      this.processToolContent(body, result);
+      return;
+    }
+
+    if (!resolvedName) {
+      this.recordMalformedToolCall(body, {
+        undeclaredNames: name ? [name] : [],
+        category: name ? "undeclared" : "malformed",
+        failureReason: name
+          ? `token-dialect call used undeclared tool name: ${name}`
+          : "token-dialect call missing tool name",
+        recoveryAttempts: ["tokenDialectParse"],
+      });
+      logger.warn("[parser] Dropping token-dialect tool call", {
+        toolName: name || "(none)",
+        category: name ? "undeclared" : "malformed",
+        contentLength: body.length,
+        content: body.substring(0, 2000),
+      });
+      this.pendingLeadIn = "";
+      return;
+    }
+
+    let args: unknown = {};
+    if (rawArgs) {
+      if (isJsonPayloadTruncated(rawArgs)) {
+        args = null;
+      } else {
+        args = parseToolArgumentsStrict(rawArgs);
+        if (args === null) {
+          try {
+            const robust = robustParseJSON(rawArgs);
+            if (robust && typeof robust === "object") args = robust;
+          } catch {}
+        }
+      }
+    }
+
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      this.recordMalformedToolCall(body, {
+        category: "malformed",
+        failureReason:
+          "token-dialect call arguments JSON invalid or truncated",
+        recoveryAttempts: ["tokenDialectParse", "parseToolArgumentsStrict"],
+      });
+      logger.warn("[parser] Dropping token-dialect tool call (bad arguments)", {
+        toolName: resolvedName,
+        category: "malformed",
+        contentLength: body.length,
+        content: body.substring(0, 2000),
+      });
+      this.pendingLeadIn = "";
+      return;
+    }
+
+    if (isToolcallDebugEnabled()) {
+      logger.debug("[parser] token-dialect tool call parsed", {
+        name: resolvedName,
+        argsKeys: Object.keys(args as Record<string, unknown>),
+      });
+    }
+
+    this.finalizeSuccessfulToolCall(
+      {
+        id: `call_${crypto.randomUUID()}`,
+        name: resolvedName,
+        arguments: this.normalizeArgumentsForTool(
+          resolvedName,
+          args as Record<string, unknown>,
+        ),
+      },
+      result,
+    );
+  }
 
   private processToolContent(content: string, result: ParserResult): void {
     const t = content.trim();
